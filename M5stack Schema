@@ -1,0 +1,382 @@
+// ==========================================================
+// Matches the purchased sensors/devices:
+// - Liquid flow: YF-S201 (hall effect)
+// - Pressure: G1/4 pressure transmitters (4 units)
+// - Temperature: PT1000 RTD + MAX31865 (SPI) + thermistors + IR thermal sensor
+// - Oxygen (gas side): ultrasonic O2 sensor (conc % + gas flow L/min + gas temp C)
+// - Pumps: Kamoer KPHM900 (100–900 mL/min) x2
+// - Bubble trap present (no bubble detector sensor in purchases -> optional stub included)
+//
+// This file defines:
+// - Sensor schema: MIN / MAX / CURRENT / FLAG per sensor
+// - Hardcoded ranges per mode: HOPE / NMP / TRANSITION
+// - Setpoints defaults (HOPE/NMP)
+// - SystemStatus (GUI banner + safety)
+//
+// Drop into: DeviceModel.h / DeviceModel.cpp (VS Code PlatformIO or Arduino IDE)
+// ==========================================================
+
+#include <Arduino.h>
+
+// -----------------------------
+// Modes
+// -----------------------------
+enum PerfusionMode : uint8_t {
+  MODE_HOPE = 0,
+  MODE_NMP  = 1,
+  MODE_TRANSITION = 2
+};
+
+// -----------------------------
+// Sensor Flag States
+// -----------------------------
+enum SensorFlag : uint8_t {
+  FLAG_OK = 0,
+  FLAG_WARN_LOW,
+  FLAG_WARN_HIGH,
+  FLAG_ALARM_LOW,
+  FLAG_ALARM_HIGH,
+  FLAG_SENSOR_FAULT
+};
+
+// -----------------------------
+// Threshold bands
+// warn band = expected operating band for GUI
+// alarm band = critical band for safety
+// -----------------------------
+struct Thresholds {
+  float warnMin;
+  float warnMax;
+  float alarmMin;
+  float alarmMax;
+};
+
+// -----------------------------
+// Sensor schema required by you:
+// MIN / MAX / CURRENT / FLAG
+// + hardcoded bands per perfusion mode
+// -----------------------------
+struct SensorModel {
+  const char* name;
+  const char* unit;
+
+  float min;       // active warnMin for current mode (GUI bar)
+  float max;       // active warnMax for current mode (GUI bar)
+  float current;   // live value
+  SensorFlag flag; // OK/WARN/ALARM/FAULT
+
+  Thresholds hope;
+  Thresholds nmp;
+  Thresholds transition;
+};
+
+// -----------------------------
+// Operator Setpoints (targets) + defaults
+// -----------------------------
+struct Setpoints {
+  float liverMass_g;
+
+  float tempBathTarget_C;
+  float tempInflowTarget_C;
+
+  float pvFlowTarget_mLmin;
+  float haFlowTarget_mLmin;
+
+  float pvPressureTarget_mmHg;
+  float haPressureTarget_mmHg;
+
+  // Gas-side O2 (what your ultrasonic sensor measures)
+  float o2GasConcTarget_pct;
+  float o2GasFlowTarget_Lmin;
+
+  float warmRate_C_per_min;
+
+  static Setpoints defaultsHOPE(float liverMass_g) {
+    Setpoints s{};
+    s.liverMass_g = liverMass_g;
+
+    s.tempBathTarget_C   = 8.0f;
+    s.tempInflowTarget_C = 8.0f;
+
+    s.pvFlowTarget_mLmin = 0.1f * liverMass_g; // 0.1 mL/min/g
+    s.haFlowTarget_mLmin = 0.0f;
+
+    s.pvPressureTarget_mmHg = 2.5f;
+    s.haPressureTarget_mmHg = 0.0f;
+
+    s.o2GasConcTarget_pct  = 95.0f;
+    s.o2GasFlowTarget_Lmin = 2.0f;
+
+    s.warmRate_C_per_min = 0.5f;
+    return s;
+  }
+
+  static Setpoints defaultsNMP(float liverMass_g) {
+    Setpoints s{};
+    s.liverMass_g = liverMass_g;
+
+    s.tempBathTarget_C   = 37.0f;
+    s.tempInflowTarget_C = 37.0f;
+
+    // NMP targets from spec, but capped to pump capability (KPHM900 ≈ 900 mL/min max)
+    s.pvFlowTarget_mLmin = min(900.0f, 0.75f * liverMass_g);
+    s.haFlowTarget_mLmin = min(900.0f, 0.25f * liverMass_g);
+
+    s.pvPressureTarget_mmHg = 9.0f;
+    s.haPressureTarget_mmHg = 40.0f;
+
+    s.o2GasConcTarget_pct  = 95.0f;
+    s.o2GasFlowTarget_Lmin = 2.0f;
+
+    s.warmRate_C_per_min = 0.5f;
+    return s;
+  }
+};
+
+// -----------------------------
+// System summary (for GUI banner + safety)
+// -----------------------------
+struct SystemStatus {
+  PerfusionMode mode = MODE_HOPE;
+
+  bool warningActive = false;
+  bool safetyTrip    = false;
+
+  // Two KPHM900 pumps
+  float pvPumpCmd_percent = 0.0f;
+  float haPumpCmd_percent = 0.0f;
+  bool  pumpEnabled       = true;
+
+  // Optional: bubble trap present (no sensor)
+  bool  bubbleTrapPresent = true;
+};
+
+// -----------------------------
+// Helper: evaluate flag from thresholds
+// -----------------------------
+static inline SensorFlag evalFlag(float v, const Thresholds& t) {
+  if (isnan(v) || isinf(v)) return FLAG_SENSOR_FAULT;
+
+  if (v < t.alarmMin) return FLAG_ALARM_LOW;
+  if (v > t.alarmMax) return FLAG_ALARM_HIGH;
+
+  if (v < t.warnMin)  return FLAG_WARN_LOW;
+  if (v > t.warnMax)  return FLAG_WARN_HIGH;
+
+  return FLAG_OK;
+}
+
+// -----------------------------
+// Sensor indices (stable IDs for mapping)
+// Use these instead of hardcoding array numbers in your GUI code.
+// -----------------------------
+enum SensorId : uint8_t {
+  S_PV_PRESSURE = 0,
+  S_HA_PRESSURE,
+  S_PV_FLOW,
+  S_HA_FLOW,
+  S_TEMP_BATH_PT1000,
+  S_TEMP_INFLOW_PT1000,
+  S_TEMP_POSTHX_THERM,
+  S_TEMP_ORGAN_IR,
+  S_O2_GAS_CONC,
+  S_O2_GAS_FLOW,
+  S_O2_SENSOR_TEMP,
+  S_POWER_BUS,
+  SENSOR_COUNT_ID
+};
+
+// -----------------------------
+// FULL sensor list (matches purchased hardware)
+// -----------------------------
+SensorModel sensors[] = {
+
+  // 0) PV Pressure (G1/4 transmitter)
+  {
+    "PV Pressure", "mmHg",
+    0, 15, NAN, FLAG_SENSOR_FAULT,
+    {0.0f, 3.0f, 0.0f, 3.5f},        // HOPE
+    {7.0f, 12.0f, 5.0f, 15.0f},      // NMP
+    {0.0f, 6.0f, 0.0f, 8.0f}         // TRANSITION
+  },
+
+  // 1) HA Pressure (G1/4 transmitter)
+  {
+    "HA Pressure", "mmHg",
+    0, 80, NAN, FLAG_SENSOR_FAULT,
+    {0.0f, 10.0f, 0.0f, 15.0f},      // HOPE (usually unused)
+    {25.0f, 55.0f, 15.0f, 65.0f},    // NMP
+    {15.0f, 40.0f, 10.0f, 50.0f}     // TRANSITION
+  },
+
+  // 2) PV Flow (YF-S201 + pump cap)
+  {
+    "PV Flow", "mL/min",
+    0, 1000, NAN, FLAG_SENSOR_FAULT,
+    {50.0f, 250.0f, 0.0f, 400.0f},   // HOPE
+    {300.0f, 900.0f, 0.0f, 950.0f},  // NMP (cap)
+    {50.0f, 600.0f, 0.0f, 900.0f}    // TRANSITION
+  },
+
+  // 3) HA Flow (YF-S201 + pump cap)
+  {
+    "HA Flow", "mL/min",
+    0, 1000, NAN, FLAG_SENSOR_FAULT,
+    {0.0f, 50.0f, 0.0f, 100.0f},     // HOPE unused
+    {150.0f, 700.0f, 0.0f, 900.0f},  // NMP (cap)
+    {50.0f, 400.0f, 0.0f, 700.0f}    // TRANSITION
+  },
+
+  // 4) Bath Temp (PT1000 via MAX31865)
+  {
+    "Bath Temp (PT1000)", "C",
+    0, 45, NAN, FLAG_SENSOR_FAULT,
+    {4.0f, 10.0f, 2.0f, 12.0f},      // HOPE
+    {36.5f, 37.5f, 35.0f, 39.0f},    // NMP
+    {4.0f, 37.0f, 2.0f, 39.0f}       // TRANSITION
+  },
+
+  // 5) Inflow Temp (PT1000 via MAX31865)
+  {
+    "Inflow Temp (PT1000)", "C",
+    0, 45, NAN, FLAG_SENSOR_FAULT,
+    {4.0f, 10.0f, 2.0f, 12.0f},
+    {36.5f, 37.5f, 35.0f, 39.0f},
+    {4.0f, 37.0f, 2.0f, 39.0f}
+  },
+
+  // 6) Post-HX Temp (Thermistor)
+  {
+    "Post-HX Temp (Thermistor)", "C",
+    0, 45, NAN, FLAG_SENSOR_FAULT,
+    {4.0f, 10.0f, 2.0f, 12.0f},
+    {36.5f, 37.5f, 35.0f, 39.0f},
+    {4.0f, 37.0f, 2.0f, 39.0f}
+  },
+
+  // 7) Organ Surface Temp (IR sensor)
+  {
+    "Organ Surface Temp (IR)", "C",
+    0, 50, NAN, FLAG_SENSOR_FAULT,
+    {0.0f, 15.0f, -5.0f, 20.0f},     // HOPE (cold surface)
+    {30.0f, 39.0f, 25.0f, 42.0f},    // NMP
+    {0.0f, 39.0f, -5.0f, 42.0f}      // TRANSITION
+  },
+
+  // 8) O2 Gas Concentration (ultrasonic O2 sensor)
+  {
+    "O2 Gas Concentration", "%",
+    0, 100, NAN, FLAG_SENSOR_FAULT,
+    {90.0f, 100.0f, 80.0f, 100.0f},  // HOPE
+    {90.0f, 100.0f, 80.0f, 100.0f},  // NMP
+    {80.0f, 100.0f, 60.0f, 100.0f}   // TRANSITION
+  },
+
+  // 9) O2 Gas Flow (ultrasonic O2 sensor)
+  {
+    "O2 Gas Flow", "L/min",
+    0, 15, NAN, FLAG_SENSOR_FAULT,
+    {0.5f, 10.0f, 0.0f, 15.0f},
+    {0.5f, 10.0f, 0.0f, 15.0f},
+    {0.0f, 10.0f, 0.0f, 15.0f}
+  },
+
+  // 10) O2 Sensor Temperature (ultrasonic O2 sensor internal temp)
+  {
+    "O2 Sensor Temp", "C",
+    0, 60, NAN, FLAG_SENSOR_FAULT,
+    {5.0f, 55.0f, 0.0f, 60.0f},
+    {5.0f, 55.0f, 0.0f, 60.0f},
+    {5.0f, 55.0f, 0.0f, 60.0f}
+  },
+
+  // 11) Power Bus Voltage (optional)
+  {
+    "Power Bus", "V",
+    0, 30, NAN, FLAG_SENSOR_FAULT,
+    {11.5f, 12.6f, 11.0f, 13.0f},
+    {11.5f, 12.6f, 11.0f, 13.0f},
+    {11.5f, 12.6f, 11.0f, 13.0f}
+  }
+};
+
+static const size_t SENSOR_COUNT = sizeof(sensors) / sizeof(sensors[0]);
+
+static_assert(SENSOR_COUNT == SENSOR_COUNT_ID, "SensorId enum count must match sensors[] size");
+
+// -----------------------------
+// Utilities
+// -----------------------------
+static inline const char* modeToStr(PerfusionMode m) {
+  switch (m) {
+    case MODE_HOPE: return "HOPE";
+    case MODE_NMP: return "NMP";
+    case MODE_TRANSITION: return "TRANSITION";
+    default: return "UNKNOWN";
+  }
+}
+
+static inline bool isValidIndex(uint8_t idx) {
+  return idx < SENSOR_COUNT;
+}
+
+// Set a sensor reading by stable ID
+static inline void setSensorCurrent(SensorId id, float value) {
+  if (!isValidIndex(id)) return;
+  sensors[id].current = value;
+}
+
+// -----------------------------
+// Apply mode thresholds: sets active min/max and flags for every sensor
+// -----------------------------
+void applyModeToSensors(PerfusionMode mode) {
+  for (size_t i = 0; i < SENSOR_COUNT; i++) {
+    Thresholds t;
+    if (mode == MODE_HOPE) t = sensors[i].hope;
+    else if (mode == MODE_NMP) t = sensors[i].nmp;
+    else t = sensors[i].transition;
+
+    sensors[i].min = t.warnMin;
+    sensors[i].max = t.warnMax;
+    sensors[i].flag = evalFlag(sensors[i].current, t);
+  }
+}
+
+// -----------------------------
+// System status aggregation (for GUI banner and safety decision)
+// -----------------------------
+void updateSystemStatus(SystemStatus& sys) {
+  sys.warningActive = false;
+  sys.safetyTrip = false;
+
+  for (size_t i = 0; i < SENSOR_COUNT; i++) {
+    const SensorFlag f = sensors[i].flag;
+
+    if (f == FLAG_WARN_LOW || f == FLAG_WARN_HIGH) sys.warningActive = true;
+    if (f == FLAG_ALARM_LOW || f == FLAG_ALARM_HIGH) sys.safetyTrip = true;
+
+    if (f == FLAG_SENSOR_FAULT) {
+      sys.warningActive = true;
+      // If you want sensor faults to hard-stop, flip this on:
+      // sys.safetyTrip = true;
+    }
+  }
+}
+
+// -----------------------------
+// Optional: quick helpers for GUI color coding
+// -----------------------------
+static inline uint32_t flagToColor(SensorFlag f) {
+  // Return your own color codes for M5Stack if you want.
+  // Placeholder values:
+  switch (f) {
+    case FLAG_OK: return 0x00FF00;        // green
+    case FLAG_WARN_LOW:
+    case FLAG_WARN_HIGH: return 0xFFFF00; // yellow
+    case FLAG_ALARM_LOW:
+    case FLAG_ALARM_HIGH: return 0xFF0000;// red
+    case FLAG_SENSOR_FAULT: return 0x808080; // gray
+    default: return 0xFFFFFF;
+  }
+}
+
